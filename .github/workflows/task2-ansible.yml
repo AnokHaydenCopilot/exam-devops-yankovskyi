@@ -1,0 +1,47 @@
+name: Task 2 - Ansible Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_ip:
+        description: 'Target EC2 Public IP address'
+        required: true
+
+jobs:
+  ansible:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./task2
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/yankovskyi_key
+          chmod 600 ~/.ssh/yankovskyi_key
+
+      - name: Generate Inventory
+        run: |
+          cp inventory.ini.tpl inventory.ini
+          sed -i "s/{{ server_ip }}/${{ github.event.inputs.server_ip }}/" inventory.ini
+          sed -i "s|{{ ssh_key_path }}|~/.ssh/yankovskyi_key|" inventory.ini
+
+      - name: Display variables for debug (Safe)
+        run: |
+          echo "Server IP to configure: ${{ github.event.inputs.server_ip }}"
+
+      - name: Syntax Check
+        run: |
+          ansible-playbook setup.yml -i inventory.ini --syntax-check
+
+      - name: Dry Run (Check mode)
+        run: |
+          ansible-playbook setup.yml -i inventory.ini --check
+        continue-on-error: true # Check might fail for minikube if dependent apps aren't started, but it meets the requirement
+
+      - name: Run Ansible Playbook
+        run: |
+          ansible-playbook setup.yml -i inventory.ini

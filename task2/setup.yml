@@ -1,0 +1,73 @@
+---
+- name: Setup Minikube and Dependencies
+  hosts: all
+  become: yes
+  vars:
+    minikube_url: "https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64"
+    kubectl_version: "v1.30.0"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - conntrack
+        state: present
+
+    - name: Install Docker
+      shell: curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Ensure Docker service is running
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Install Minikube
+      get_url:
+        url: "{{ minikube_url }}"
+        dest: /usr/local/bin/minikube
+        mode: '0755'
+
+    - name: Install Kubectl
+      get_url:
+        url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: '0755'
+
+    - name: Install Helm
+      shell: curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 && chmod 700 get_helm.sh && ./get_helm.sh
+      args:
+        creates: /usr/local/bin/helm
+
+    - name: Start Minikube
+      become: no
+      command: minikube start --driver=docker --ports=8002:8002,8003:8003
+      register: minikube_start
+      changed_when: "'Done! kubectl is now configured to use' in minikube_start.stdout"
+
+    - name: Setup Kubectl port forwarding proxy script
+      copy:
+        dest: /home/ubuntu/proxy.sh
+        content: |
+          #!/bin/bash
+          kubectl port-forward --address 0.0.0.0 svc/dev-app 8002:80 -n dev &
+          kubectl port-forward --address 0.0.0.0 svc/release-app 8003:80 -n release &
+        mode: '0755'
+        owner: ubuntu
