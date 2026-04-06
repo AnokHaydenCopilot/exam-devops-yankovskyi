@@ -21,7 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      variables: write   # needed to save INSTANCE_IP as a repo variable
     defaults:
       run:
         working-directory: ./task1
