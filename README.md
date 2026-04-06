@@ -22,7 +22,7 @@ task3/                       # Kubernetes manifests
 
 ---
 
-## Task 1 — Infrastructure (Terraform + AWS)
+## Task 1  Infrastructure (Terraform + AWS)
 
 **Workflow:** `task1-apply.yml`
 
@@ -55,7 +55,7 @@ The instance IP is stored in **SSM Parameter Store** (`/yankovskyi/ec2/instance_
 
 ---
 
-## Task 2 — VM Configuration (Ansible)
+## Task 2  VM Configuration (Ansible)
 
 **Workflow:** `task2-ansible.yml`
 
@@ -72,7 +72,7 @@ The SSH private key is loaded from AWS Secrets Manager at runtime. The instance 
 
 ---
 
-## Task 3 — Application Deployment (Docker + Kubernetes)
+## Task 3  Application Deployment (Docker + Kubernetes)
 
 **Workflow:** `task3-deploy.yml`  
 **Source app:** [YulianSalo/devops-exam-pt2](https://github.com/YulianSalo/devops-exam-pt2)
@@ -106,8 +106,8 @@ curl http://<EC2_IP>:8003   # → Hello, World! 1.0.0
 
 > **Prerequisites:** GitHub Actions secrets `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` must be set.
 
-1. **Task 1** — run `Task 1 - Terraform Infrastructure (Apply)` → provisions all AWS resources, stores IP in SSM
-2. **Task 2** — run `Task 2 - Ansible Setup` (no inputs needed, IP auto-resolved from SSM)
-3. **Task 3** — run `Task 3 - Deploy Application` with `target_env=dev`, then again with `target_env=release`
+1. **Task 1**  run `Task 1 - Terraform Infrastructure (Apply)` → provisions all AWS resources, stores IP in SSM
+2. **Task 2**  run `Task 2 - Ansible Setup` (no inputs needed, IP auto-resolved from SSM)
+3. **Task 3**  run `Task 3 - Deploy Application` with `target_env=dev`, then again with `target_env=release`
 
 To tear down: run `Task 1 - Terraform Infrastructure (Destroy)`.
