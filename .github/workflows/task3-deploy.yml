@@ -31,9 +31,8 @@ jobs:
       packages: write
 
     outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
-      node_port: ${{ steps.meta.outputs.node_port }}
       image_full: ${{ steps.meta.outputs.image_full }}
+      image_tag:  ${{ steps.meta.outputs.image_tag }}
 
     steps:
       - name: Checkout source application
@@ -50,16 +49,13 @@ jobs:
           if [ "${{ github.event.inputs.target_env }}" = "dev" ]; then
             git checkout develop
             IMAGE_TAG="dev"
-            NODE_PORT="30002"
           else
             git checkout tags/1.0.0
             IMAGE_TAG="release"
-            NODE_PORT="30003"
           fi
 
-          echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
-          echo "node_port=${NODE_PORT}"   >> "$GITHUB_OUTPUT"
           echo "image_full=${IMAGE_BASE}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -117,16 +113,30 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H "$TARGET_IP" >> ~/.ssh/known_hosts 2>/dev/null
 
-      # ── GHCR image pull secret ────────────────────────────────────────────
-      - name: Create GHCR image pull secret in namespace
+      # ── Set per-environment config ────────────────────────────────────────
+      - name: Set environment config
+        run: |
+          if [ "${{ github.event.inputs.target_env }}" = "dev" ]; then
+            echo "HOST_PORT=8002"    >> "$GITHUB_ENV"
+            echo "NODE_PORT=30002"   >> "$GITHUB_ENV"
+            echo "APP_NAME=dev-app"  >> "$GITHUB_ENV"
+            echo "MANIFEST=task3/deployment-dev.yaml" >> "$GITHUB_ENV"
+          else
+            echo "HOST_PORT=8003"       >> "$GITHUB_ENV"
+            echo "NODE_PORT=30003"      >> "$GITHUB_ENV"
+            echo "APP_NAME=release-app" >> "$GITHUB_ENV"
+            echo "MANIFEST=task3/deployment-release.yaml" >> "$GITHUB_ENV"
+          fi
+
+      # ── Create namespace + GHCR pull secret ──────────────────────────────
+      - name: Create namespace and GHCR pull secret
         run: |
           ENV="${{ github.event.inputs.target_env }}"
-          # Ensure namespace exists first
-          ssh ubuntu@"$TARGET_IP" \
-            "minikube kubectl -- create namespace ${ENV} --dry-run=client -o yaml \
-             | minikube kubectl -- apply -f -"
 
-          # Create / update imagePullSecret for ghcr.io
+          ssh ubuntu@"$TARGET_IP" \
+            "minikube kubectl -- create namespace ${ENV} \
+             --dry-run=client -o yaml | minikube kubectl -- apply -f -"
+
           ssh ubuntu@"$TARGET_IP" \
             "minikube kubectl -- create secret docker-registry ghcr-secret \
                --docker-server=ghcr.io \
@@ -136,80 +146,69 @@ jobs:
                --dry-run=client -o yaml \
              | minikube kubectl -- apply -f -"
 
-      # ── Set deployment parameters ─────────────────────────────────────────
-      - name: Set environment variables
+      # ── Render manifest (substitute only IMAGE_NAME) ──────────────────────
+      - name: Render manifest
         run: |
-          ENV="${{ github.event.inputs.target_env }}"
-          if [ "$ENV" = "dev" ]; then
-            echo "HOST_PORT=8002"    >> "$GITHUB_ENV"
-            echo "APP_LABEL=dev-app" >> "$GITHUB_ENV"
-          else
-            echo "HOST_PORT=8003"      >> "$GITHUB_ENV"
-            echo "APP_LABEL=release-app" >> "$GITHUB_ENV"
-          fi
-
-      # ── Render deployment manifest ────────────────────────────────────────
-      - name: Render deployment manifest
-        run: |
-          ENV="${{ github.event.inputs.target_env }}"
-          APP_NAME="${ENV}-app"
           IMAGE_FULL="${{ needs.build.outputs.image_full }}"
-          IMAGE_TAG="${{ needs.build.outputs.image_tag }}"
-          NODE_PORT="${{ needs.build.outputs.node_port }}"
-
-          sed \
-            -e "s|NAMESPACE|${ENV}|g" \
-            -e "s|APP_NAME|${APP_NAME}|g" \
-            -e "s|IMAGE_NAME|${IMAGE_FULL}|g" \
-            -e "s|IMAGE_TAG|${IMAGE_TAG}|g" \
-            -e "s|NODE_PORT|${NODE_PORT}|g" \
-            task3/deployment.yaml > task3/deploy-rendered.yaml
-
+          sed "s|IMAGE_NAME|${IMAGE_FULL}|g" "$MANIFEST" > /tmp/deploy-rendered.yaml
           echo "=== Rendered manifest ==="
-          cat task3/deploy-rendered.yaml
+          cat /tmp/deploy-rendered.yaml
 
-      # ── Dry-run validation ────────────────────────────────────────────────
+      # ── K8s dry-run validation ────────────────────────────────────────────
       - name: K8s dry-run validation
         run: |
-          scp task3/deploy-rendered.yaml \
-            ubuntu@"$TARGET_IP":/home/ubuntu/deploy-${{ github.event.inputs.target_env }}.yaml
+          ENV="${{ github.event.inputs.target_env }}"
+          scp /tmp/deploy-rendered.yaml ubuntu@"$TARGET_IP":/tmp/deploy-${ENV}.yaml
           ssh ubuntu@"$TARGET_IP" \
-            "minikube kubectl -- apply -f /home/ubuntu/deploy-${{ github.event.inputs.target_env }}.yaml --dry-run=client"
+            "minikube kubectl -- apply -f /tmp/deploy-${ENV}.yaml --dry-run=client"
 
-      # ── Actual deploy ─────────────────────────────────────────────────────
+      # ── Deploy ────────────────────────────────────────────────────────────
       - name: Deploy to Kubernetes
         run: |
+          ENV="${{ github.event.inputs.target_env }}"
           ssh ubuntu@"$TARGET_IP" \
-            "minikube kubectl -- apply -f /home/ubuntu/deploy-${{ github.event.inputs.target_env }}.yaml"
-
-          # Wait for rollout
+            "minikube kubectl -- apply -f /tmp/deploy-${ENV}.yaml"
           ssh ubuntu@"$TARGET_IP" \
-            "minikube kubectl -- rollout status deployment/${{ github.event.inputs.target_env }}-app-deployment \
-             -n ${{ github.event.inputs.target_env }} --timeout=120s"
+            "minikube kubectl -- rollout status deployment/${APP_NAME}-deployment \
+             -n ${ENV} --timeout=180s"
 
-      # ── Port-forward (specific to this env only) ──────────────────────────
-      - name: Setup port-forward for ${{ github.event.inputs.target_env }}
+      # ── Stable port-forward via socat (iptables DNAT) ────────────────────
+      # kubectl port-forward dies when SSH exits. socat forwards stably:
+      # EC2:HOST_PORT → minikube_ip:NODE_PORT (NodePort) — survives reboots
+      - name: Setup stable port-forward via socat
         run: |
           ENV="${{ github.event.inputs.target_env }}"
-          APP_NAME="${ENV}-app"
 
-          # Write the port-forward script locally, then scp it and execute
-          cat > /tmp/start-portforward.sh << SCRIPT
+          # Write the socat forwarding script to the server
+          cat > /tmp/setup-socat.sh << 'SCRIPT'
           #!/bin/bash
-          pkill -f "port-forward.*${HOST_PORT}" || true
+          set -euo pipefail
+          HOST_PORT="$1"
+          NODE_PORT="$2"
+          ENV="$3"
+
+          # Get minikube cluster IP
+          MINIKUBE_IP=$(minikube ip)
+          echo "Minikube IP: $MINIKUBE_IP"
+
+          # Kill existing socat on this port (idempotent)
+          pkill -f "socat.*:${HOST_PORT}" || true
           sleep 1
-          nohup minikube kubectl -- port-forward \
-            --address 0.0.0.0 \
-            svc/${APP_NAME} ${HOST_PORT}:80 \
-            -n ${ENV} \
-            > /tmp/portforward-${ENV}.log 2>&1 &
-          echo "Port-forward started for ${ENV} on port ${HOST_PORT}, pid=\$!"
+
+          # Start socat as a persistent daemon:
+          # Listen on all interfaces at HOST_PORT, forward to minikube NodePort
+          nohup socat TCP-LISTEN:${HOST_PORT},fork,reuseaddr \
+            TCP:${MINIKUBE_IP}:${NODE_PORT} \
+            > /tmp/socat-${ENV}.log 2>&1 &
+
+          echo "socat started: 0.0.0.0:${HOST_PORT} -> ${MINIKUBE_IP}:${NODE_PORT} (pid=$!)"
           SCRIPT
 
-          chmod +x /tmp/start-portforward.sh
-          scp /tmp/start-portforward.sh ubuntu@"$TARGET_IP":/tmp/start-portforward-${ENV}.sh
-          ssh ubuntu@"$TARGET_IP" "bash /tmp/start-portforward-${ENV}.sh"
-          sleep 8
+          scp /tmp/setup-socat.sh ubuntu@"$TARGET_IP":/tmp/setup-socat.sh
+          ssh ubuntu@"$TARGET_IP" \
+            "bash /tmp/setup-socat.sh '${HOST_PORT}' '${NODE_PORT}' '${ENV}'"
+
+          sleep 5
 
       # ── Verify ────────────────────────────────────────────────────────────
       - name: Verify application endpoint
@@ -225,12 +224,11 @@ jobs:
 
       - name: Summary
         run: |
-          ENV="${{ github.event.inputs.target_env }}"
           {
             echo "### ✅ Task 3 — Application Deployed"
             echo "| Key | Value |"
             echo "|---|---|"
-            echo "| Environment | \`${ENV}\` |"
+            echo "| Environment | \`${{ github.event.inputs.target_env }}\` |"
             echo "| URL | http://${TARGET_IP}:${HOST_PORT} |"
             echo "| Image | \`${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}\` |"
             echo ""

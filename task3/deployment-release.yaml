@@ -1,0 +1,65 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: release-app-deployment
+  namespace: release
+  labels:
+    app: release-app
+    env: release
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: release-app
+  template:
+    metadata:
+      labels:
+        app: release-app
+        env: release
+    spec:
+      imagePullSecrets:
+        - name: ghcr-secret
+      containers:
+        - name: release-app
+          image: IMAGE_NAME:release
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: release-app
+  namespace: release
+  labels:
+    app: release-app
+    env: release
+spec:
+  type: NodePort
+  ports:
+    - port: 80
+      targetPort: 8000
+      nodePort: 30003
+      protocol: TCP
+  selector:
+    app: release-app
