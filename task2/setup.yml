@@ -33,6 +33,7 @@
         creates: /usr/bin/docker
 
     - name: Add ubuntu user to docker group
+      check_mode: no   # docker group won't exist during --check (Docker not installed yet)
       user:
         name: ubuntu
         groups: docker
@@ -42,6 +43,7 @@
       meta: reset_connection
 
     - name: Ensure Docker service is started and enabled
+      check_mode: no   # Docker may not be installed yet during --check
       systemd:
         name: docker
         state: started
@@ -70,6 +72,7 @@
 
     # ── Minikube must run as the non-root ubuntu user ──────────────────────
     - name: Start Minikube (docker driver)
+      check_mode: no   # Minikube can't start in --check mode (Docker not installed)
       become: no
       become_user: ubuntu
       command: minikube start --driver=docker --memory=4096 --cpus=2
@@ -78,6 +81,7 @@
       failed_when: minikube_start.rc != 0
 
     - name: Verify Kubernetes cluster is healthy
+      check_mode: no   # Must skip during check mode (k8s not running)
       become: no
       become_user: ubuntu
       command: kubectl get nodes
