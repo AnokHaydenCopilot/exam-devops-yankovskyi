@@ -33,6 +33,9 @@
         groups: docker
         append: yes
 
+    - name: Reset ssh connection to allow user changes to affect ansible user
+      meta: reset_connection
+
     - name: Ensure Docker service is running
       systemd:
         name: docker
