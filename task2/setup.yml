@@ -26,6 +26,7 @@
         state: present
 
     - name: Install Docker (official convenience script)
+      check_mode: no   # must actually run so docker group exists for next task
       shell: |
         curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
         sh /tmp/get-docker.sh
