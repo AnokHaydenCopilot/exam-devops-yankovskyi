@@ -12,7 +12,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/app
   KUBE_HOST: ${{ secrets.KUBE_HOST }} # VM public IP
 
 jobs:
@@ -28,6 +27,8 @@ jobs:
       - name: Determine Branch/Tag
         id: branch
         run: |
+          LOWER_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_NAME=$LOWER_REPO/app" >> $GITHUB_ENV
           cd app-src
           if [ "${{ github.event.inputs.target_env }}" == "dev" ]; then
             git checkout develop
