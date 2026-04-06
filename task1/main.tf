@@ -82,14 +82,9 @@ data "aws_ami" "ubuntu" {
   owners = ["099720109477"]
 }
 
-resource "tls_private_key" "yankovskyi_key" {
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}
-
 resource "aws_key_pair" "yankovskyi_keypair" {
   key_name   = "yankovskyi-aws-key"
-  public_key = tls_private_key.yankovskyi_key.public_key_openssh
+  public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDWvzJuCEnoB9at5o7l/v5bMh4PVt9Okk6YsBB8qYHiu28ZslWsiPffsYaqE8+bYzA0r4kMQ608DN4S6i2/2irCMRO03zQH4zBPlw5IoH/VaSMaqf5UB0aviK+Wm5r5xHPFCqNxAqmGMCdq2hIE8ugCTJUpKKXiDtMwQerM9P4L55imU0ZJfNwPNEc5cUyJ9HHotZOOVru2RBDBFygLR3IbimrF5aU8Bjc0zQDauzDbqVjK4IjTyU8/t/quzTP8bXThljk0B/+OrCFdNMqiLgxV3haQwV8dGrkLTW7wIkDJusn6imOPFs99LT0Tt4Jp1bMkJ65P6lALmeWV/1dNtc3vH7FHQpXvAYcf5K0WUE0+078u4eAei0uC/8D2WdIGkq9b5tW7OSNqJuHMymz4VZasLWils0m83I/Mopb4UR0tLwKZzBlPP/2NTKVTD9LQeb2QNiMB5fST51vFjjW87BIm+Ts+pyplzEZiaI1WbUSFK8241NruNbN6JQ2d8JyWB2AW6KJkmBJuH/4r0qLH50ZcwvIhd3A0eymH6P0evKy3kxVnCChDTiXoRnVN07dbg5v4vf1XEAZkrmn+gMKk9W73pRCrzPrg08Bb2nGOl/a8Jf22W+VNrRQLohEmUKRihOHqCZ9Sf1vbsU0RZ1XBgAl4F0xWVGTrRb2jSDn0PV3gxw== moder@MSI"
 }
 
 resource "aws_instance" "yankovskyi_node" {
@@ -112,9 +107,4 @@ resource "aws_s3_bucket" "yankovskyi_bucket" {
 
 output "instance_public_ip" {
   value = aws_instance.yankovskyi_node.public_ip
-}
-
-output "private_key" {
-  value     = tls_private_key.yankovskyi_key.private_key_pem
-  sensitive = true
 }
