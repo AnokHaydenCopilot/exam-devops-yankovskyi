@@ -148,7 +148,8 @@ jobs:
 
       # Save IP as a GitHub repo variable so task2/task3 don't need SSM
       # The GITHUB_TOKEN with variables:write permission is sufficient
-      - name: Save instance IP as GitHub repo variable
+      - name: Save instance IP as GitHub repo variable (best-effort)
+        continue-on-error: true   # GITHUB_TOKEN lacks admin scope; update manually if this fails
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
