@@ -89,7 +89,7 @@ resource "aws_key_pair" "yankovskyi_keypair" {
 
 resource "aws_instance" "yankovskyi_node" {
   ami           = data.aws_ami.ubuntu.id
-  instance_type = "t3.medium"
+  instance_type = "t2.micro"
   subnet_id     = aws_subnet.yankovskyi_subnet.id
   vpc_security_group_ids = [aws_security_group.yankovskyi_firewall.id]
   key_name      = aws_key_pair.yankovskyi_keypair.key_name
