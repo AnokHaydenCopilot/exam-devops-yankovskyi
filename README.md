@@ -1,43 +1,113 @@
-# DevOps Exam - Vitalii Yankovskyi
+# DevOps Exam — Vitalii Yankovskyi
 
-This repository contains the completed tasks for the DevOps Part 2 Exam.
+CI/CD pipeline that provisions AWS infrastructure, configures a Kubernetes node, and deploys a Django application to two isolated environments.
 
-## Task 1: Infrastructure Provisioning (Terraform)
-- **Files**: `task1/main.tf`
-- **CI/CD**: `.github/workflows/task1-apply.yml`, `.github/workflows/task1-destroy.yml`
-- **Result**: Provisions AWS VPC (`10.10.10.0/24`), subnet, IGW, route table, security group (ports 22, 80, 443, 8000-8003), `t3.medium` EC2 instance running Ubuntu 24.04, and the exam bucket.
-- **State**: Terraform state is stored in the remote S3 backend `yankovskyi-terraform-state-exam/state/terraform.tfstate`. The workflow bootstraps the bucket before `terraform init`.
-- **SSH**: The CI generates the SSH key pair, stores the private key in AWS Secrets Manager, and passes only the public key to Terraform.
+## Repository layout
 
-## Task 2: VM Configuration (Ansible)
-- **Files**: `task2/setup.yml`, `task2/inventory.ini.tpl`
-- **CI/CD**: `.github/workflows/task2-ansible.yml`
-- **Result**: Installs Docker, Minikube, kubectl, Helm, and supporting dependencies on the provisioned EC2 instance. The workflow loads the SSH private key from AWS Secrets Manager, builds `inventory.ini` dynamically from the provided server IP, and runs syntax plus `--check` validation before the real playbook.
-
-## Task 3: Application Deployment (CI/CD to Minikube)
-- **Files**: `task3/deployment.yaml`
-- **CI/CD**: `.github/workflows/task3-deploy.yml`
-- **Result**: Pipeline builds a Docker image from the [devops-exam-pt2](https://github.com/YulianSalo/devops-exam-pt2) repository, pushes it to GHCR, and deploys it to the remote EC2 Minikube cluster using Kubernetes manifests.
-  - `dev` builds from `develop` and is exposed on port 8002.
-  - `release` builds from tag `1.0.0` and is exposed on port 8003.
-  - Deployment is validated with a remote `kubectl --dry-run=client` before apply, then verified with `curl` against the published port.
+```
+task1/                       # Terraform — AWS infrastructure
+  main.tf
+task2/                       # Ansible — VM configuration
+  setup.yml
+  inventory.ini.tpl
+task3/                       # Kubernetes manifests
+  deployment-dev.yaml
+  deployment-release.yaml
+.github/workflows/
+  task1-apply.yml            # Terraform apply
+  task1-destroy.yml          # Terraform destroy (bonus)
+  task2-ansible.yml          # Ansible playbook runner
+  task3-deploy.yml           # Docker build + K8s deploy
+```
 
 ---
-### Requirements Addressed
-- [x] S3 backend logic with remote tfstate
-- [x] Pre-flight pipeline checks (terraform plan, ansible check, kubectl dry-run)
-- [x] Secrets kept out of the repository and stored in AWS Secrets Manager
-- [x] Port proxying and dedicated configurations for dev/release node ports
-- [x] Automated tear-down (destroy pipeline)
-- [x] CI-generated SSH key pair
 
-### How to run
-1. Ensure GitHub Actions secrets are set: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
-2. Run `Task 1 - Terraform Infrastructure` from GitHub Actions. This creates the state bucket if needed, generates the SSH key material, and provisions the AWS resources.
-3. Copy the EC2 public IP from the workflow output.
-4. Run `Task 2 - Ansible Setup` with that IP.
-5. Run `Task 3 - Deploy App` with the same IP and choose `dev` or `release`.
-6. Validate the deployment with `curl http://<EC2_PUBLIC_IP>:8002` for `dev` or `curl http://<EC2_PUBLIC_IP>:8003` for `release`.
+## Task 1 — Infrastructure (Terraform + AWS)
 
-### State note
-Terraform does not create the S3 backend bucket automatically just because the backend block exists. `terraform init` checks whether the bucket exists and is reachable before planning or applying. The workflow bootstraps the bucket first, and the actual state lives in S3 under `state/terraform.tfstate`.
+**Workflow:** `task1-apply.yml`
+
+Provisions the following AWS resources in `eu-central-1`:
+
+| Resource | Name |
+|---|---|
+| VPC | `yankovskyi-vpc` · `10.10.10.0/24` |
+| Security group | `yankovskyi-firewall` · inbound: 22, 80, 443, 8000–8003 |
+| EC2 instance | `yankovskyi-node` · Ubuntu 24.04 · `m7i-flex.large` (meets Minikube requirements) |
+| S3 bucket | `yankovskyi-bucket` |
+
+**SSH key management:** CI generates a fresh `ed25519` key pair on first run, stores the private key in **AWS Secrets Manager** (`yankovskyi/ci/ssh-key`), and passes only the public key to Terraform. Subsequent runs retrieve the existing key. No keys are ever committed to the repository.
+
+**Remote Terraform state:**
+
+```hcl
+backend "s3" {
+  bucket = "yankovskyi-terraform-state-exam"
+  key    = "state/terraform.tfstate"
+  region = "eu-central-1"
+}
+```
+
+The state bucket is **separate** from the application bucket. The workflow bootstraps it before `terraform init` runs — `terraform init` does not create the bucket, it only connects to it. If the bucket does not exist at init time, Terraform exits with an error. State is stored remotely so any future run (or any runner) picks up the current infrastructure state instead of treating everything as new.
+
+The instance IP is stored in **SSM Parameter Store** (`/yankovskyi/ec2/instance_ip`) as a Terraform-managed resource, so Task 2 and Task 3 retrieve it automatically without manual input.
+
+**Pre-flight:** `terraform validate` + `terraform plan` run before `apply`. The pipeline stops on any error.
+
+---
+
+## Task 2 — VM Configuration (Ansible)
+
+**Workflow:** `task2-ansible.yml`
+
+Installs on the EC2 instance:
+- Docker (official convenience script)
+- Minikube (docker driver, `--memory=4096 --cpus=2`)
+- kubectl `v1.30.0`
+- Helm
+- Supporting packages: `socat`, `conntrack`, `curl`, `jq`, etc.
+
+The SSH private key is loaded from AWS Secrets Manager at runtime. The instance IP is resolved automatically from SSM Parameter Store.
+
+**Pre-flight:** `ansible-playbook --syntax-check` + `--check` (dry-run) run before the real playbook. The pipeline stops on syntax errors.
+
+---
+
+## Task 3 — Application Deployment (Docker + Kubernetes)
+
+**Workflow:** `task3-deploy.yml`  
+**Source app:** [YulianSalo/devops-exam-pt2](https://github.com/YulianSalo/devops-exam-pt2)
+
+Two independent environments, triggered by workflow input `target_env`:
+
+| Environment | Branch/Tag | Port | NodePort |
+|---|---|---|---|
+| `dev` | `develop` | **8002** | 30002 |
+| `release` | `1.0.0` | **8003** | 30003 |
+
+**Pipeline steps:**
+1. Clone source → checkout correct branch/tag → build Docker image → push to GHCR
+2. Resolve EC2 IP from SSM
+3. Create K8s namespace + GHCR image pull secret
+4. Render environment-specific manifest (`deployment-dev.yaml` / `deployment-release.yaml`)
+5. `kubectl apply --dry-run=client` validation
+6. `kubectl apply` + `rollout status` wait
+7. Start `socat` on the EC2 host: `EC2:8002 → minikubeIP:30002` (stable, survives SSH disconnect)
+8. `curl` endpoint verification
+
+**Verification:**
+```bash
+curl http://<EC2_IP>:8002   # → Hello, World! DEVELOP
+curl http://<EC2_IP>:8003   # → Hello, World! 1.0.0
+```
+
+---
+
+## How to run
+
+> **Prerequisites:** GitHub Actions secrets `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` must be set.
+
+1. **Task 1** — run `Task 1 - Terraform Infrastructure (Apply)` → provisions all AWS resources, stores IP in SSM
+2. **Task 2** — run `Task 2 - Ansible Setup` (no inputs needed, IP auto-resolved from SSM)
+3. **Task 3** — run `Task 3 - Deploy Application` with `target_env=dev`, then again with `target_env=release`
+
+To tear down: run `Task 1 - Terraform Infrastructure (Destroy)`.
