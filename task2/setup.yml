@@ -91,25 +91,5 @@
       debug:
         msg: "{{ kube_nodes.stdout_lines }}"
 
-    # ── Proxy script to forward both environments ──────────────────────────
-    - name: Create port-forward proxy script
-      copy:
-        dest: /home/ubuntu/proxy.sh
-        content: |
-          #!/bin/bash
-          # Forward dev environment (port 8002)
-          nohup minikube kubectl -- port-forward \
-            --address 0.0.0.0 svc/dev-app 8002:80 -n dev \
-            > /tmp/portforward-dev.log 2>&1 &
 
-          # Forward release environment (port 8003)
-          nohup minikube kubectl -- port-forward \
-            --address 0.0.0.0 svc/release-app 8003:80 -n release \
-            > /tmp/portforward-release.log 2>&1 &
 
-          echo "Port forwarding started."
-          echo "  dev:     http://$(curl -s ifconfig.me):8002"
-          echo "  release: http://$(curl -s ifconfig.me):8003"
-        mode: '0755'
-        owner: ubuntu
-        group: ubuntu
