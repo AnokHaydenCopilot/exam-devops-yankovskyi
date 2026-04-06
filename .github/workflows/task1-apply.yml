@@ -143,19 +143,6 @@ jobs:
             echo "| Instance Public IP | \`$instance_ip\` |"
             echo "| S3 Bucket | \`$bucket_name\` |"
             echo ""
-            echo "> Instance IP stored in SSM (/yankovskyi/ec2/instance_ip) and GitHub repo variable INSTANCE_IP"
+            echo "> IP auto-saved to SSM: \`/yankovskyi/ec2/instance_ip\`"
+            echo "> Task 2 and Task 3 will pick it up automatically."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # Save IP as a GitHub repo variable so task2/task3 don't need SSM
-      # The GITHUB_TOKEN with variables:write permission is sufficient
-      - name: Save instance IP as GitHub repo variable (best-effort)
-        continue-on-error: true   # GITHUB_TOKEN lacks admin scope; update manually if this fails
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          instance_ip="$(terraform output -raw instance_public_ip)"
-          echo "Saving INSTANCE_IP=${instance_ip} as repo variable..."
-          gh variable set INSTANCE_IP \
-            --body "$instance_ip" \
-            --repo "${{ github.repository }}"
-          echo "✅ INSTANCE_IP variable updated."

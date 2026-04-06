@@ -31,30 +31,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ── Resolve target IP ────────────────────────────────────────────────
+      # ── Resolve target IP ───────────────────────────────────────────────
       - name: Resolve server IP
         run: |
           set -euo pipefail
-          # Priority: 1) manual input  2) GitHub repo var  3) SSM Parameter Store
+          # Priority: 1) manual input  2) SSM Parameter Store (auto-updated by Terraform)
           TARGET_IP="${{ github.event.inputs.server_ip }}"
 
           if [ -z "$TARGET_IP" ]; then
-            TARGET_IP="${{ vars.INSTANCE_IP }}"
-            if [ -n "$TARGET_IP" ]; then
-              echo "Using GitHub repo variable INSTANCE_IP: $TARGET_IP"
-            fi
-          fi
-
-          if [ -z "$TARGET_IP" ]; then
-            echo "Falling back to SSM Parameter Store..."
+            echo "Fetching IP from SSM (/yankovskyi/ec2/instance_ip)..."
             TARGET_IP="$(aws ssm get-parameter \
               --name "$SSM_IP_PARAM" \
               --query 'Parameter.Value' --output text)"
           fi
 
           if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "None" ]; then
-            echo "ERROR: Could not resolve instance IP from any source."
-            echo "Run Task 1 first, or specify server_ip manually."
+            echo "ERROR: Could not resolve instance IP. Run Task 1 first."
             exit 1
           fi
 
