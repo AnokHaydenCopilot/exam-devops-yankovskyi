@@ -1,4 +1,4 @@
-name: Task 1 - Terraform Destroy
+name: Task 1 - Terraform Infrastructure (Destroy)
 
 on:
   workflow_dispatch:
@@ -10,6 +10,7 @@ env:
 
 jobs:
   destroy:
+    name: Terraform Destroy
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,28 +28,75 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Load SSH key material
+      - name: Load SSH key from Secrets Manager
         run: |
           set -euo pipefail
-          secret_json="$(aws secretsmanager get-secret-value --secret-id "$SSH_SECRET_NAME" --query SecretString --output text)"
+          secret_json="$(aws secretsmanager get-secret-value \
+            --secret-id "$SSH_SECRET_NAME" \
+            --query SecretString --output text)"
           private_key_file="${RUNNER_TEMP}/yankovskyi-ci-key"
           public_key_file="${private_key_file}.pub"
-          printf '%s' "$(printf '%s' "$secret_json" | jq -r '.private_key')" > "$private_key_file"
-          printf '%s' "$(printf '%s' "$secret_json" | jq -r '.public_key')" > "$public_key_file"
+          printf '%s' "$(printf '%s' "$secret_json" | jq -r '.private_key')" \
+            > "$private_key_file"
+          printf '%s' "$(printf '%s' "$secret_json" | jq -r '.public_key')" \
+            > "$public_key_file"
           echo "SSH_PUBLIC_KEY=$(cat "$public_key_file")" >> "$GITHUB_ENV"
+
+      # ── Pre-destroy: release any elastic IPs attached to our VPC ──────────
+      # This prevents the infamous "mapped public address" DependencyViolation
+      - name: Release Elastic IPs attached to our resources
+        run: |
+          set -euo pipefail
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=yankovskyi-vpc" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "No VPC found — nothing to clean up."
+            exit 0
+          fi
+
+          echo "VPC ID: $VPC_ID"
+
+          # Disassociate and release all EIPs linked to our VPC
+          for alloc_id in $(aws ec2 describe-addresses \
+              --query "Addresses[*].AllocationId" --output text 2>/dev/null); do
+            assoc_id=$(aws ec2 describe-addresses \
+              --allocation-ids "$alloc_id" \
+              --query 'Addresses[0].AssociationId' --output text 2>/dev/null || echo "")
+            if [ -n "$assoc_id" ] && [ "$assoc_id" != "None" ]; then
+              echo "Disassociating EIP $alloc_id (assoc $assoc_id)..."
+              aws ec2 disassociate-address --association-id "$assoc_id" || true
+            fi
+            echo "Releasing EIP $alloc_id..."
+            aws ec2 release-address --allocation-id "$alloc_id" || true
+          done
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
-        run: terraform init
+        run: terraform init -input=false
 
       - name: Terraform Destroy
-        run: terraform destroy -auto-approve -var="ssh_public_key=${SSH_PUBLIC_KEY}" -var="ssh_key_name=${SSH_KEY_NAME}"
+        run: |
+          terraform destroy -auto-approve \
+            -var="ssh_public_key=${SSH_PUBLIC_KEY}" \
+            -var="ssh_key_name=${SSH_KEY_NAME}"
 
-      - name: Clean up SSH secret
+      # ── Clean up Secrets Manager entry ─────────────────────────────────────
+      - name: Delete SSH key secret
         if: always()
         run: |
           aws secretsmanager delete-secret \
             --secret-id "$SSH_SECRET_NAME" \
-            --force-delete-without-recovery || true
+            --force-delete-without-recovery 2>/dev/null || true
+          echo "SSH secret deleted (or was already gone)."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 🗑️ Task 1 — Infrastructure Destroyed"
+            echo "All Terraform-managed AWS resources have been removed."
+          } >> "$GITHUB_STEP_SUMMARY"

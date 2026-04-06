@@ -23,7 +23,8 @@ variable "ssh_key_name" {
 }
 
 variable "ssh_public_key" {
-  type = string
+  type      = string
+  sensitive = true
 }
 
 variable "bucket_name" {
@@ -31,9 +32,10 @@ variable "bucket_name" {
   default = "yankovskyi-bucket"
 }
 
+# m7i-flex.large: 2 vCPU, 8 GiB RAM — meets Minikube/K8s system requirements
 variable "instance_type" {
   type    = string
-  default = "t3.micro"
+  default = "m7i-flex.large"
 }
 
 variable "vpc_cidr" {
@@ -61,6 +63,7 @@ resource "aws_subnet" "yankovskyi_subnet" {
   vpc_id                  = aws_vpc.yankovskyi_vpc.id
   cidr_block              = var.subnet_cidr
   map_public_ip_on_launch = true
+  availability_zone       = "${var.aws_region}a"
 
   tags = {
     Name = "yankovskyi-subnet"
@@ -81,16 +84,19 @@ resource "aws_route_table" "yankovskyi_rt" {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.yankovskyi_igw.id
   }
+  tags = {
+    Name = "yankovskyi-rt"
+  }
 }
 
-resource "aws_route_table_association" "a" {
+resource "aws_route_table_association" "yankovskyi_rta" {
   subnet_id      = aws_subnet.yankovskyi_subnet.id
   route_table_id = aws_route_table.yankovskyi_rt.id
 }
 
 resource "aws_security_group" "yankovskyi_firewall" {
   name        = "yankovskyi-firewall"
-  description = "Security rules for Exam"
+  description = "Firewall rules for Yankovskyi exam"
   vpc_id      = aws_vpc.yankovskyi_vpc.id
 
   dynamic "ingress" {
@@ -103,10 +109,11 @@ resource "aws_security_group" "yankovskyi_firewall" {
     }
   }
 
+  # Allow all outbound traffic (ports 1-65535 TCP + UDP + ICMP)
   egress {
-    from_port   = 1
-    to_port     = 65535
-    protocol    = "tcp"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
@@ -125,7 +132,7 @@ data "aws_ami" "ubuntu" {
     name   = "virtualization-type"
     values = ["hvm"]
   }
-  owners = ["099720109477"]
+  owners = ["099720109477"] # Canonical
 }
 
 resource "aws_key_pair" "yankovskyi_keypair" {
@@ -134,14 +141,32 @@ resource "aws_key_pair" "yankovskyi_keypair" {
 }
 
 resource "aws_instance" "yankovskyi_node" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.yankovskyi_subnet.id
-  vpc_security_group_ids = [aws_security_group.yankovskyi_firewall.id]
-  key_name               = aws_key_pair.yankovskyi_keypair.key_name
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.yankovskyi_subnet.id
+  vpc_security_group_ids      = [aws_security_group.yankovskyi_firewall.id]
+  key_name                    = aws_key_pair.yankovskyi_keypair.key_name
+  associate_public_ip_address = true
+
+  root_block_device {
+    volume_type           = "gp3"
+    volume_size           = 30
+    delete_on_termination = true
+  }
 
   tags = {
     Name = "yankovskyi-node"
+  }
+}
+
+# Store instance IP in SSM so other workflows can retrieve it without manual input
+resource "aws_ssm_parameter" "instance_ip" {
+  name  = "/yankovskyi/ec2/instance_ip"
+  type  = "String"
+  value = aws_instance.yankovskyi_node.public_ip
+
+  tags = {
+    Name = "yankovskyi-instance-ip"
   }
 }
 
@@ -171,9 +196,11 @@ resource "aws_s3_bucket_public_access_block" "yankovskyi_bucket_block" {
 }
 
 output "instance_public_ip" {
-  value = aws_instance.yankovskyi_node.public_ip
+  value       = aws_instance.yankovskyi_node.public_ip
+  description = "Public IP of the EC2 node"
 }
 
 output "bucket_name" {
-  value = aws_s3_bucket.yankovskyi_bucket.bucket
+  value       = aws_s3_bucket.yankovskyi_bucket.bucket
+  description = "Name of the S3 bucket"
 }

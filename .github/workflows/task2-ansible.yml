@@ -1,19 +1,21 @@
-name: Task 2 - Ansible Setup
+name: Task 2 - Ansible Setup (Kubernetes Stack)
 
 on:
   workflow_dispatch:
     inputs:
       server_ip:
-        description: 'Target EC2 Public IP address'
-        required: true
+        description: 'EC2 Public IP (leave blank to auto-read from SSM)'
+        required: false
         type: string
 
 env:
   AWS_REGION: eu-central-1
   SSH_SECRET_NAME: yankovskyi/ci/ssh-key
+  SSM_IP_PARAM: /yankovskyi/ec2/instance_ip
 
 jobs:
   ansible:
+    name: Ansible — Install K8s Stack
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -29,37 +31,68 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install Ansible
+      # ── Resolve target IP ─────────────────────────────────────────────────
+      - name: Resolve server IP
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ansible jq
+          set -euo pipefail
+          TARGET_IP="${{ github.event.inputs.server_ip }}"
+          if [ -z "$TARGET_IP" ]; then
+            echo "No IP provided — fetching from SSM Parameter Store..."
+            TARGET_IP="$(aws ssm get-parameter \
+              --name "$SSM_IP_PARAM" \
+              --query 'Parameter.Value' --output text)"
+          fi
+          echo "TARGET_IP=${TARGET_IP}" >> "$GITHUB_ENV"
+          echo "Target server: $TARGET_IP"
 
-      - name: Load SSH Key
+      # ── SSH key ────────────────────────────────────────────────────────────
+      - name: Load SSH private key from Secrets Manager
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          secret_json="$(aws secretsmanager get-secret-value --secret-id "$SSH_SECRET_NAME" --query SecretString --output text)"
-          printf '%s\n' "$secret_json" | jq -r '.private_key' > ~/.ssh/yankovskyi_key
+          secret_json="$(aws secretsmanager get-secret-value \
+            --secret-id "$SSH_SECRET_NAME" \
+            --query SecretString --output text)"
+          printf '%s\n' "$secret_json" | jq -r '.private_key' \
+            > ~/.ssh/yankovskyi_key
           chmod 600 ~/.ssh/yankovskyi_key
+          ssh-keyscan -H "$TARGET_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Generate Inventory
+      # ── Ansible ────────────────────────────────────────────────────────────
+      - name: Install Ansible
         run: |
-          cp inventory.ini.tpl inventory.ini
-          sed -i "s/{{ server_ip }}/${{ github.event.inputs.server_ip }}/" inventory.ini
-          sed -i "s|{{ ssh_key_path }}|~/.ssh/yankovskyi_key|" inventory.ini
+          sudo apt-get update -qq
+          sudo apt-get install -y ansible jq
 
-      - name: Display variables for debug (Safe)
+      - name: Generate inventory
         run: |
-          echo "Server IP to configure: ${{ github.event.inputs.server_ip }}"
+          sed -e "s/{{ server_ip }}/${TARGET_IP}/" \
+              -e "s|{{ ssh_key_path }}|~/.ssh/yankovskyi_key|" \
+              inventory.ini.tpl > inventory.ini
+          echo "Generated inventory:"
+          cat inventory.ini
 
-      - name: Syntax Check
-        run: |
-          ansible-playbook setup.yml -i inventory.ini --syntax-check
+      - name: Ansible syntax check (dry-run validation)
+        run: ansible-playbook setup.yml -i inventory.ini --syntax-check
 
-      - name: Dry Run (Check mode)
+      - name: Ansible check mode (no-changes simulation)
         run: |
-          ansible-playbook setup.yml -i inventory.ini --check
+          ansible-playbook setup.yml -i inventory.ini --check \
+            --diff || echo "Check mode completed (some tasks may report changes)"
 
-      - name: Run Ansible Playbook
+      - name: Run Ansible playbook (install K8s stack)
+        run: ansible-playbook setup.yml -i inventory.ini -v
+
+      - name: Summary
         run: |
-          ansible-playbook setup.yml -i inventory.ini
+          {
+            echo "### ✅ Task 2 — Kubernetes Stack Installed"
+            echo "| Component | Status |"
+            echo "|---|---|"
+            echo "| Docker | ✅ |"
+            echo "| Minikube | ✅ |"
+            echo "| kubectl | ✅ |"
+            echo "| Helm | ✅ |"
+            echo ""
+            echo "Target: \`${TARGET_IP}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

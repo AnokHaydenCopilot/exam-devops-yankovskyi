@@ -1,52 +1,67 @@
-name: Task 3 - Deploy App
+name: Task 3 - Deploy Application
 
 on:
   workflow_dispatch:
     inputs:
       target_env:
-        description: 'Environment to deploy (dev/release)'
+        description: 'Environment to deploy'
         required: true
         type: choice
         options:
           - dev
           - release
       server_ip:
-        description: 'Target EC2 Public IP address'
-        required: true
+        description: 'EC2 Public IP (leave blank to auto-read from SSM)'
+        required: false
         type: string
 
 env:
   REGISTRY: ghcr.io
   AWS_REGION: eu-central-1
   SSH_SECRET_NAME: yankovskyi/ci/ssh-key
+  SSM_IP_PARAM: /yankovskyi/ec2/instance_ip
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────
   build:
+    name: Build & Push Docker Image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      node_port: ${{ steps.meta.outputs.node_port }}
+      image_full: ${{ steps.meta.outputs.image_full }}
+
     steps:
-      - name: Checkout Source Repo
+      - name: Checkout source application
         run: git clone https://github.com/YulianSalo/devops-exam-pt2.git app-src
 
-      - name: Determine Branch/Tag
-        id: branch
+      - name: Compute image metadata
+        id: meta
         run: |
+          set -euo pipefail
           LOWER_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE_NAME=$LOWER_REPO/app" >> $GITHUB_ENV
+          IMAGE_BASE="${{ env.REGISTRY }}/${LOWER_REPO}/app"
+
           cd app-src
-          if [ "${{ github.event.inputs.target_env }}" == "dev" ]; then
+          if [ "${{ github.event.inputs.target_env }}" = "dev" ]; then
             git checkout develop
-            echo "tag=dev" >> $GITHUB_OUTPUT
-            echo "node_port=30002" >> $GITHUB_OUTPUT
+            IMAGE_TAG="dev"
+            NODE_PORT="30002"
           else
             git checkout tags/1.0.0
-            echo "tag=release" >> $GITHUB_OUTPUT
-            echo "node_port=30003" >> $GITHUB_OUTPUT
+            IMAGE_TAG="release"
+            NODE_PORT="30003"
           fi
 
-      - name: Log in to the Container registry
+          echo "image_tag=${IMAGE_TAG}"   >> "$GITHUB_OUTPUT"
+          echo "node_port=${NODE_PORT}"   >> "$GITHUB_OUTPUT"
+          echo "image_full=${IMAGE_BASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -58,15 +73,14 @@ jobs:
         with:
           context: app-src
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.branch.outputs.tag }}
+          tags: ${{ steps.meta.outputs.image_full }}:${{ steps.meta.outputs.image_tag }}
 
-    outputs:
-      image_tag: ${{ steps.branch.outputs.tag }}
-      node_port: ${{ steps.branch.outputs.node_port }}
-
+  # ─────────────────────────────────────────────────────────────────────────
   deploy:
+    name: Deploy to Kubernetes
     runs-on: ubuntu-latest
     needs: build
+
     steps:
       - uses: actions/checkout@v4
 
@@ -77,53 +91,147 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # ── Resolve target IP ─────────────────────────────────────────────────
+      - name: Resolve server IP
+        run: |
+          set -euo pipefail
+          TARGET_IP="${{ github.event.inputs.server_ip }}"
+          if [ -z "$TARGET_IP" ]; then
+            echo "No IP provided — fetching from SSM Parameter Store..."
+            TARGET_IP="$(aws ssm get-parameter \
+              --name "$SSM_IP_PARAM" \
+              --query 'Parameter.Value' --output text)"
+          fi
+          echo "TARGET_IP=${TARGET_IP}" >> "$GITHUB_ENV"
+          echo "Target server: $TARGET_IP"
+
+      # ── SSH ───────────────────────────────────────────────────────────────
       - name: Configure SSH
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          secret_json="$(aws secretsmanager get-secret-value --secret-id "$SSH_SECRET_NAME" --query SecretString --output text)"
+          secret_json="$(aws secretsmanager get-secret-value \
+            --secret-id "$SSH_SECRET_NAME" \
+            --query SecretString --output text)"
           printf '%s\n' "$secret_json" | jq -r '.private_key' > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ github.event.inputs.server_ip }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H "$TARGET_IP" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Setup Kube Namespace
+      # ── GHCR image pull secret ────────────────────────────────────────────
+      - name: Create GHCR image pull secret in namespace
         run: |
-           ssh ubuntu@${{ github.event.inputs.server_ip }} "minikube kubectl -- create namespace ${{ github.event.inputs.target_env }} --dry-run=client -o yaml | minikube kubectl -- apply -f -"
+          ENV="${{ github.event.inputs.target_env }}"
+          # Ensure namespace exists first
+          ssh ubuntu@"$TARGET_IP" \
+            "minikube kubectl -- create namespace ${ENV} --dry-run=client -o yaml \
+             | minikube kubectl -- apply -f -"
 
-      - name: Deploy application
+          # Create / update imagePullSecret for ghcr.io
+          ssh ubuntu@"$TARGET_IP" \
+            "minikube kubectl -- create secret docker-registry ghcr-secret \
+               --docker-server=ghcr.io \
+               --docker-username=${{ github.actor }} \
+               --docker-password=${{ secrets.GITHUB_TOKEN }} \
+               --namespace=${ENV} \
+               --dry-run=client -o yaml \
+             | minikube kubectl -- apply -f -"
+
+      # ── Set deployment parameters ─────────────────────────────────────────
+      - name: Set environment variables
         run: |
-          # Copy deployment spec
-          cp task3/deployment.yaml task3/deploy.yaml
-          
-          # Replace variables
-          sed -i "s/NAMESPACE/${{ github.event.inputs.target_env }}/g" task3/deploy.yaml
-          sed -i "s/APP_NAME/${{ github.event.inputs.target_env }}-app/g" task3/deploy.yaml
-          sed -i "s|IMAGE_NAME|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|g" task3/deploy.yaml
-          sed -i "s/IMAGE_TAG/${{ needs.build.outputs.image_tag }}/g" task3/deploy.yaml
-          sed -i "s/NODE_PORT/${{ needs.build.outputs.node_port }}/g" task3/deploy.yaml
-
-          # Copy to EC2 and deploy via minikube
-          scp task3/deploy.yaml ubuntu@${{ github.event.inputs.server_ip }}:/home/ubuntu/
-          
-          # K8s Dry-run validation
-          ssh ubuntu@${{ github.event.inputs.server_ip }} "minikube kubectl -- apply -f /home/ubuntu/deploy.yaml --dry-run=client"
-
-          # Actual K8s Deploy
-          ssh ubuntu@${{ github.event.inputs.server_ip }} "minikube kubectl -- apply -f /home/ubuntu/deploy.yaml"
-
-          # Forward ports using nohup
-          ssh ubuntu@${{ github.event.inputs.server_ip }} "pkill -f 'kubectl -- port-forward' || true"
-          if [ "${{ github.event.inputs.target_env }}" == "dev" ]; then
-             ssh ubuntu@${{ github.event.inputs.server_ip }} "nohup minikube kubectl -- port-forward --address 0.0.0.0 svc/${{ github.event.inputs.target_env }}-app 8002:80 -n ${{ github.event.inputs.target_env }} > /dev/null 2>&1 &"
+          ENV="${{ github.event.inputs.target_env }}"
+          if [ "$ENV" = "dev" ]; then
+            echo "HOST_PORT=8002"    >> "$GITHUB_ENV"
+            echo "APP_LABEL=dev-app" >> "$GITHUB_ENV"
           else
-             ssh ubuntu@${{ github.event.inputs.server_ip }} "nohup minikube kubectl -- port-forward --address 0.0.0.0 svc/${{ github.event.inputs.target_env }}-app 8003:80 -n ${{ github.event.inputs.target_env }} > /dev/null 2>&1 &"
+            echo "HOST_PORT=8003"      >> "$GITHUB_ENV"
+            echo "APP_LABEL=release-app" >> "$GITHUB_ENV"
           fi
 
+      # ── Render deployment manifest ────────────────────────────────────────
+      - name: Render deployment manifest
+        run: |
+          ENV="${{ github.event.inputs.target_env }}"
+          APP_NAME="${ENV}-app"
+          IMAGE_FULL="${{ needs.build.outputs.image_full }}"
+          IMAGE_TAG="${{ needs.build.outputs.image_tag }}"
+          NODE_PORT="${{ needs.build.outputs.node_port }}"
+
+          sed \
+            -e "s|NAMESPACE|${ENV}|g" \
+            -e "s|APP_NAME|${APP_NAME}|g" \
+            -e "s|IMAGE_NAME|${IMAGE_FULL}|g" \
+            -e "s|IMAGE_TAG|${IMAGE_TAG}|g" \
+            -e "s|NODE_PORT|${NODE_PORT}|g" \
+            task3/deployment.yaml > task3/deploy-rendered.yaml
+
+          echo "=== Rendered manifest ==="
+          cat task3/deploy-rendered.yaml
+
+      # ── Dry-run validation ────────────────────────────────────────────────
+      - name: K8s dry-run validation
+        run: |
+          scp task3/deploy-rendered.yaml \
+            ubuntu@"$TARGET_IP":/home/ubuntu/deploy-${{ github.event.inputs.target_env }}.yaml
+          ssh ubuntu@"$TARGET_IP" \
+            "minikube kubectl -- apply -f /home/ubuntu/deploy-${{ github.event.inputs.target_env }}.yaml --dry-run=client"
+
+      # ── Actual deploy ─────────────────────────────────────────────────────
+      - name: Deploy to Kubernetes
+        run: |
+          ssh ubuntu@"$TARGET_IP" \
+            "minikube kubectl -- apply -f /home/ubuntu/deploy-${{ github.event.inputs.target_env }}.yaml"
+
+          # Wait for rollout
+          ssh ubuntu@"$TARGET_IP" \
+            "minikube kubectl -- rollout status deployment/${{ github.event.inputs.target_env }}-app-deployment \
+             -n ${{ github.event.inputs.target_env }} --timeout=120s"
+
+      # ── Port-forward (specific to this env only) ──────────────────────────
+      - name: Setup port-forward for ${{ github.event.inputs.target_env }}
+        run: |
+          ENV="${{ github.event.inputs.target_env }}"
+          APP_NAME="${ENV}-app"
+
+          # Kill only the port-forward for THIS environment's port
+          ssh ubuntu@"$TARGET_IP" "pkill -f 'port-forward.*${HOST_PORT}' || true"
+          sleep 2
+
+          # Start fresh port-forward for this environment
+          ssh ubuntu@"$TARGET_IP" \
+            "nohup minikube kubectl -- port-forward \
+             --address 0.0.0.0 \
+             svc/${APP_NAME} ${HOST_PORT}:80 \
+             -n ${ENV} \
+             > /tmp/portforward-${ENV}.log 2>&1 &"
+
+          sleep 5
+
+      # ── Verify ────────────────────────────────────────────────────────────
       - name: Verify application endpoint
         run: |
-          set -euo pipefail
-          if [ "${{ github.event.inputs.target_env }}" = "dev" ]; then
-            curl --fail --retry 10 --retry-delay 5 http://${{ github.event.inputs.server_ip }}:8002
-          else
-            curl --fail --retry 10 --retry-delay 5 http://${{ github.event.inputs.server_ip }}:8003
-          fi
+          echo "Testing http://${TARGET_IP}:${HOST_PORT} ..."
+          curl --fail \
+               --retry 15 \
+               --retry-delay 5 \
+               --retry-connrefused \
+               -s -o /dev/null -w "HTTP %{http_code}\n" \
+               "http://${TARGET_IP}:${HOST_PORT}"
+          echo "✅ Application is reachable at http://${TARGET_IP}:${HOST_PORT}"
+
+      - name: Summary
+        run: |
+          ENV="${{ github.event.inputs.target_env }}"
+          {
+            echo "### ✅ Task 3 — Application Deployed"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Environment | \`${ENV}\` |"
+            echo "| URL | http://${TARGET_IP}:${HOST_PORT} |"
+            echo "| Image | \`${{ needs.build.outputs.image_full }}:${{ needs.build.outputs.image_tag }}\` |"
+            echo ""
+            echo "#### Quick test:"
+            echo "\`\`\`"
+            echo "curl http://${TARGET_IP}:${HOST_PORT}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

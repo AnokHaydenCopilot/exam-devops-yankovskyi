@@ -1,7 +1,8 @@
-name: Task 1 - Terraform Infrastructure
+name: Task 1 - Terraform Infrastructure (Apply)
 
 on:
   push:
+    branches: [main]
     paths:
       - 'task1/**'
       - '.github/workflows/task1-apply.yml'
@@ -16,6 +17,7 @@ env:
 
 jobs:
   terraform:
+    name: Terraform Apply
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -33,10 +35,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # ── Bootstrap: ensure the S3 state-bucket exists ──────────────────────
       - name: Bootstrap Terraform state bucket
         run: |
           set -euo pipefail
-          if ! aws s3api head-bucket --bucket "$STATE_BUCKET" >/dev/null 2>&1; then
+          if ! aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
             aws s3api create-bucket \
               --bucket "$STATE_BUCKET" \
               --region "$AWS_REGION" \
@@ -46,65 +49,98 @@ jobs:
               --versioning-configuration Status=Enabled
             aws s3api put-bucket-encryption \
               --bucket "$STATE_BUCKET" \
-              --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+              --server-side-encryption-configuration \
+                '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            echo "State bucket created."
+          else
+            echo "State bucket already exists."
           fi
 
+      # ── SSH key: generate once, persist in Secrets Manager ────────────────
       - name: Prepare SSH key material
         run: |
           set -euo pipefail
           key_dir="${RUNNER_TEMP}/yankovskyi-ssh"
           mkdir -p "$key_dir"
           private_key_file="$key_dir/$SSH_KEY_NAME"
-          public_key_file="$private_key_file.pub"
+          public_key_file="${private_key_file}.pub"
 
-          if aws secretsmanager describe-secret --secret-id "$SSH_SECRET_NAME" >/dev/null 2>&1; then
-            secret_json="$(aws secretsmanager get-secret-value --secret-id "$SSH_SECRET_NAME" --query SecretString --output text)"
-            printf '%s' "$(printf '%s' "$secret_json" | jq -r '.private_key')" > "$private_key_file"
-            printf '%s' "$(printf '%s' "$secret_json" | jq -r '.public_key')" > "$public_key_file"
+          if aws secretsmanager describe-secret \
+               --secret-id "$SSH_SECRET_NAME" >/dev/null 2>&1; then
+            echo "Retrieving existing SSH key from Secrets Manager..."
+            secret_json="$(aws secretsmanager get-secret-value \
+              --secret-id "$SSH_SECRET_NAME" \
+              --query SecretString --output text)"
+            printf '%s' "$(printf '%s' "$secret_json" | jq -r '.private_key')" \
+              > "$private_key_file"
+            printf '%s' "$(printf '%s' "$secret_json" | jq -r '.public_key')" \
+              > "$public_key_file"
           else
-            ssh-keygen -t ed25519 -f "$private_key_file" -N "" -C "vitalii.yankovskyi@github-actions"
-            secret_json="$(jq -n --rawfile private_key "$private_key_file" --rawfile public_key "$public_key_file" --arg key_name "$SSH_KEY_NAME" '{private_key:$private_key,public_key:$public_key,key_name:$key_name}')"
-            aws secretsmanager create-secret --name "$SSH_SECRET_NAME" --secret-string "$secret_json"
+            echo "Generating new SSH key pair..."
+            ssh-keygen -t ed25519 -f "$private_key_file" -N "" \
+              -C "vitalii.yankovskyi@github-actions"
+            secret_json="$(jq -n \
+              --rawfile private_key "$private_key_file" \
+              --rawfile public_key  "$public_key_file" \
+              --arg     key_name    "$SSH_KEY_NAME" \
+              '{private_key:$private_key,public_key:$public_key,key_name:$key_name}')"
+            aws secretsmanager create-secret \
+              --name "$SSH_SECRET_NAME" \
+              --description "CI SSH key pair for Yankovskyi exam" \
+              --secret-string "$secret_json"
+            echo "SSH key created and stored."
           fi
 
           echo "SSH_PUBLIC_KEY=$(cat "$public_key_file")" >> "$GITHUB_ENV"
 
+      # ── Terraform ─────────────────────────────────────────────────────────
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
-        run: terraform init
+        run: terraform init -input=false
 
-      - name: Import existing AWS resources
+      # Import pre-existing AWS resources so Terraform doesn't try to re-create them
+      - name: Import existing AWS resources (idempotent)
         run: |
           set -euo pipefail
-          if aws ec2 describe-key-pairs --key-names "$SSH_KEY_NAME" >/dev/null 2>&1; then
-            terraform import -input=false -lock=false aws_key_pair.yankovskyi_keypair "$SSH_KEY_NAME" || true
+
+          if aws ec2 describe-key-pairs \
+               --key-names "$SSH_KEY_NAME" >/dev/null 2>&1; then
+            terraform import -input=false \
+              aws_key_pair.yankovskyi_keypair "$SSH_KEY_NAME" 2>/dev/null || true
           fi
 
-          if aws s3api head-bucket --bucket "$BUCKET_NAME" >/dev/null 2>&1; then
-            terraform import -input=false -lock=false aws_s3_bucket.yankovskyi_bucket "$BUCKET_NAME" || true
+          if aws s3api head-bucket \
+               --bucket "$BUCKET_NAME" 2>/dev/null; then
+            terraform import -input=false \
+              aws_s3_bucket.yankovskyi_bucket "$BUCKET_NAME" 2>/dev/null || true
           fi
 
       - name: Terraform Validate
         run: terraform validate -no-color
 
       - name: Terraform Plan
-        run: terraform plan -no-color -out=tfplan -var="ssh_public_key=${SSH_PUBLIC_KEY}" -var="ssh_key_name=${SSH_KEY_NAME}"
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan \
+            -var="ssh_public_key=${SSH_PUBLIC_KEY}" \
+            -var="ssh_key_name=${SSH_KEY_NAME}"
 
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: terraform apply -auto-approve tfplan
 
+      # ── Publish outputs ────────────────────────────────────────────────────
       - name: Publish outputs
-        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
           instance_ip="$(terraform output -raw instance_public_ip)"
           bucket_name="$(terraform output -raw bucket_name)"
-          printf 'INSTANCE_PUBLIC_IP=%s\n' "$instance_ip" | tee "$RUNNER_TEMP/task1-instance-ip.txt"
-          printf 'BUCKET_NAME=%s\n' "$bucket_name" | tee "$RUNNER_TEMP/task1-bucket-name.txt"
           {
-            echo '### Task 1 Outputs'
-            echo "- Instance IP: $instance_ip"
-            echo "- Bucket: $bucket_name"
+            echo "### ✅ Task 1 — Infrastructure Deployed"
+            echo "| Resource | Value |"
+            echo "|---|---|"
+            echo "| Instance Public IP | \`$instance_ip\` |"
+            echo "| S3 Bucket | \`$bucket_name\` |"
+            echo ""
+            echo "> Instance IP is also stored in SSM: \`/yankovskyi/ec2/instance_ip\`"
           } >> "$GITHUB_STEP_SUMMARY"

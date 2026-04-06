@@ -1,5 +1,5 @@
 ---
-- name: Setup Minikube and Dependencies
+- name: Setup Minikube, Docker, Kubernetes and Helm
   hosts: all
   become: yes
   vars:
@@ -12,7 +12,7 @@
         update_cache: yes
         cache_valid_time: 3600
 
-    - name: Install dependencies
+    - name: Install system dependencies
       apt:
         name:
           - apt-transport-https
@@ -25,8 +25,10 @@
           - software-properties-common
         state: present
 
-    - name: Install Docker
-      shell: curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh
+    - name: Install Docker (official convenience script)
+      shell: |
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        sh /tmp/get-docker.sh
       args:
         creates: /usr/bin/docker
 
@@ -36,48 +38,74 @@
         groups: docker
         append: yes
 
-    - name: Reset ssh connection to allow user changes to affect ansible user
+    - name: Reset SSH connection so group membership takes effect
       meta: reset_connection
 
-    - name: Ensure Docker service is running
+    - name: Ensure Docker service is started and enabled
       systemd:
         name: docker
         state: started
         enabled: yes
 
-    - name: Install Minikube
+    - name: Install Minikube binary
       get_url:
         url: "{{ minikube_url }}"
         dest: /usr/local/bin/minikube
         mode: '0755'
 
-    - name: Install Kubectl
+    - name: Install kubectl binary
       get_url:
         url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
         dest: /usr/local/bin/kubectl
         mode: '0755'
 
     - name: Install Helm
-      shell: curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 && chmod 700 get_helm.sh && ./get_helm.sh
+      shell: |
+        curl -fsSL -o /tmp/get_helm.sh \
+          https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        chmod 700 /tmp/get_helm.sh
+        /tmp/get_helm.sh
       args:
         creates: /usr/local/bin/helm
 
-    - name: Start Minikube
+    # ── Minikube must run as the non-root ubuntu user ──────────────────────
+    - name: Start Minikube (docker driver)
       become: no
-      command: minikube start --driver=docker
+      become_user: ubuntu
+      command: minikube start --driver=docker --memory=4096 --cpus=2
       register: minikube_start
-      changed_when: "'Done! kubectl is now configured to use' in minikube_start.stdout"
+      changed_when: "'Done! kubectl is now configured' in minikube_start.stdout"
+      failed_when: minikube_start.rc != 0
 
-    - name: Verify Kubernetes API is reachable
+    - name: Verify Kubernetes cluster is healthy
       become: no
+      become_user: ubuntu
       command: kubectl get nodes
+      register: kube_nodes
 
-    - name: Setup Kubectl port forwarding proxy script
+    - name: Print cluster node status
+      debug:
+        msg: "{{ kube_nodes.stdout_lines }}"
+
+    # ── Proxy script to forward both environments ──────────────────────────
+    - name: Create port-forward proxy script
       copy:
         dest: /home/ubuntu/proxy.sh
         content: |
           #!/bin/bash
-          kubectl port-forward --address 0.0.0.0 svc/dev-app 8002:80 -n dev &
-          kubectl port-forward --address 0.0.0.0 svc/release-app 8003:80 -n release &
+          # Forward dev environment (port 8002)
+          nohup minikube kubectl -- port-forward \
+            --address 0.0.0.0 svc/dev-app 8002:80 -n dev \
+            > /tmp/portforward-dev.log 2>&1 &
+
+          # Forward release environment (port 8003)
+          nohup minikube kubectl -- port-forward \
+            --address 0.0.0.0 svc/release-app 8003:80 -n release \
+            > /tmp/portforward-release.log 2>&1 &
+
+          echo "Port forwarding started."
+          echo "  dev:     http://$(curl -s ifconfig.me):8002"
+          echo "  release: http://$(curl -s ifconfig.me):8003"
         mode: '0755'
         owner: ubuntu
+        group: ubuntu
