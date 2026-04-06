@@ -6,13 +6,19 @@ on:
       target_env:
         description: 'Environment to deploy (dev/release)'
         required: true
+        type: choice
         options:
           - dev
           - release
+      server_ip:
+        description: 'Target EC2 Public IP address'
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
-  KUBE_HOST: ${{ secrets.KUBE_HOST }} # VM public IP
+  AWS_REGION: eu-central-1
+  SSH_SECRET_NAME: yankovskyi/ci/ssh-key
 
 jobs:
   build:
@@ -41,14 +47,14 @@ jobs:
           fi
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v5
         with:
           context: app-src
           push: true
@@ -62,18 +68,27 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Configure SSH
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          secret_json="$(aws secretsmanager get-secret-value --secret-id "$SSH_SECRET_NAME" --query SecretString --output text)"
+          printf '%s\n' "$secret_json" | jq -r '.private_key' > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.KUBE_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ github.event.inputs.server_ip }} >> ~/.ssh/known_hosts
 
       - name: Setup Kube Namespace
         run: |
-           ssh ubuntu@${{ secrets.KUBE_HOST }} "minikube kubectl -- create namespace ${{ github.event.inputs.target_env }} --dry-run=client -o yaml | minikube kubectl -- apply -f -"
+           ssh ubuntu@${{ github.event.inputs.server_ip }} "minikube kubectl -- create namespace ${{ github.event.inputs.target_env }} --dry-run=client -o yaml | minikube kubectl -- apply -f -"
 
       - name: Deploy application
         run: |
@@ -88,17 +103,27 @@ jobs:
           sed -i "s/NODE_PORT/${{ needs.build.outputs.node_port }}/g" task3/deploy.yaml
 
           # Copy to EC2 and deploy via minikube
-          scp task3/deploy.yaml ubuntu@${{ secrets.KUBE_HOST }}:/home/ubuntu/
+          scp task3/deploy.yaml ubuntu@${{ github.event.inputs.server_ip }}:/home/ubuntu/
           
           # K8s Dry-run validation
-          ssh ubuntu@${{ secrets.KUBE_HOST }} "minikube kubectl -- apply -f /home/ubuntu/deploy.yaml --dry-run=client"
+          ssh ubuntu@${{ github.event.inputs.server_ip }} "minikube kubectl -- apply -f /home/ubuntu/deploy.yaml --dry-run=client"
 
           # Actual K8s Deploy
-          ssh ubuntu@${{ secrets.KUBE_HOST }} "minikube kubectl -- apply -f /home/ubuntu/deploy.yaml"
+          ssh ubuntu@${{ github.event.inputs.server_ip }} "minikube kubectl -- apply -f /home/ubuntu/deploy.yaml"
 
           # Forward ports using nohup
+          ssh ubuntu@${{ github.event.inputs.server_ip }} "pkill -f 'kubectl -- port-forward' || true"
           if [ "${{ github.event.inputs.target_env }}" == "dev" ]; then
-             ssh ubuntu@${{ secrets.KUBE_HOST }} "nohup minikube kubectl -- port-forward --address 0.0.0.0 svc/${{ github.event.inputs.target_env }}-app 8002:80 -n ${{ github.event.inputs.target_env }} > /dev/null 2>&1 &"
+             ssh ubuntu@${{ github.event.inputs.server_ip }} "nohup minikube kubectl -- port-forward --address 0.0.0.0 svc/${{ github.event.inputs.target_env }}-app 8002:80 -n ${{ github.event.inputs.target_env }} > /dev/null 2>&1 &"
           else
-             ssh ubuntu@${{ secrets.KUBE_HOST }} "nohup minikube kubectl -- port-forward --address 0.0.0.0 svc/${{ github.event.inputs.target_env }}-app 8003:80 -n ${{ github.event.inputs.target_env }} > /dev/null 2>&1 &"
+             ssh ubuntu@${{ github.event.inputs.server_ip }} "nohup minikube kubectl -- port-forward --address 0.0.0.0 svc/${{ github.event.inputs.target_env }}-app 8003:80 -n ${{ github.event.inputs.target_env }} > /dev/null 2>&1 &"
+          fi
+
+      - name: Verify application endpoint
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.target_env }}" = "dev" ]; then
+            curl --fail --retry 10 --retry-delay 5 http://${{ github.event.inputs.server_ip }}:8002
+          else
+            curl --fail --retry 10 --retry-delay 5 http://${{ github.event.inputs.server_ip }}:8003
           fi

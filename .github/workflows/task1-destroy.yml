@@ -3,25 +3,52 @@ name: Task 1 - Terraform Destroy
 on:
   workflow_dispatch:
 
+env:
+  AWS_REGION: eu-central-1
+  SSH_KEY_NAME: yankovskyi-ci-key
+  SSH_SECRET_NAME: yankovskyi/ci/ssh-key
+
 jobs:
   destroy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: ./task1
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: 'eu-central-1'
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Load SSH key material
+        run: |
+          set -euo pipefail
+          secret_json="$(aws secretsmanager get-secret-value --secret-id "$SSH_SECRET_NAME" --query SecretString --output text)"
+          private_key_file="${RUNNER_TEMP}/yankovskyi-ci-key"
+          public_key_file="${private_key_file}.pub"
+          printf '%s' "$(printf '%s' "$secret_json" | jq -r '.private_key')" > "$private_key_file"
+          printf '%s' "$(printf '%s' "$secret_json" | jq -r '.public_key')" > "$public_key_file"
+          echo "SSH_PUBLIC_KEY=$(cat "$public_key_file")" >> "$GITHUB_ENV"
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
+        uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
         run: terraform init
 
       - name: Terraform Destroy
-        run: terraform destroy -auto-approve
+        run: terraform destroy -auto-approve -var="ssh_public_key=${SSH_PUBLIC_KEY}" -var="ssh_key_name=${SSH_KEY_NAME}"
+
+      - name: Clean up SSH secret
+        if: always()
+        run: |
+          aws secretsmanager delete-secret \
+            --secret-id "$SSH_SECRET_NAME" \
+            --force-delete-without-recovery || true

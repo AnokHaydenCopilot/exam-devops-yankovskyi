@@ -4,36 +4,107 @@ on:
   push:
     paths:
       - 'task1/**'
+      - '.github/workflows/task1-apply.yml'
   workflow_dispatch:
+
+env:
+  AWS_REGION: eu-central-1
+  STATE_BUCKET: yankovskyi-terraform-state-exam
+  BUCKET_NAME: yankovskyi-bucket
+  SSH_KEY_NAME: yankovskyi-ci-key
+  SSH_SECRET_NAME: yankovskyi/ci/ssh-key
 
 jobs:
   terraform:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: ./task1
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: 'eu-central-1'
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Bootstrap Terraform state bucket
+        run: |
+          set -euo pipefail
+          if ! aws s3api head-bucket --bucket "$STATE_BUCKET" >/dev/null 2>&1; then
+            aws s3api create-bucket \
+              --bucket "$STATE_BUCKET" \
+              --region "$AWS_REGION" \
+              --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            aws s3api put-bucket-versioning \
+              --bucket "$STATE_BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption \
+              --bucket "$STATE_BUCKET" \
+              --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          fi
+
+      - name: Prepare SSH key material
+        run: |
+          set -euo pipefail
+          key_dir="${RUNNER_TEMP}/yankovskyi-ssh"
+          mkdir -p "$key_dir"
+          private_key_file="$key_dir/$SSH_KEY_NAME"
+          public_key_file="$private_key_file.pub"
+
+          if aws secretsmanager describe-secret --secret-id "$SSH_SECRET_NAME" >/dev/null 2>&1; then
+            secret_json="$(aws secretsmanager get-secret-value --secret-id "$SSH_SECRET_NAME" --query SecretString --output text)"
+            printf '%s' "$(printf '%s' "$secret_json" | jq -r '.private_key')" > "$private_key_file"
+            printf '%s' "$(printf '%s' "$secret_json" | jq -r '.public_key')" > "$public_key_file"
+          else
+            ssh-keygen -t ed25519 -f "$private_key_file" -N "" -C "vitalii.yankovskyi@github-actions"
+            secret_json="$(jq -n --rawfile private_key "$private_key_file" --rawfile public_key "$public_key_file" --arg key_name "$SSH_KEY_NAME" '{private_key:$private_key,public_key:$public_key,key_name:$key_name}')"
+            aws secretsmanager create-secret --name "$SSH_SECRET_NAME" --secret-string "$secret_json"
+          fi
+
+          echo "SSH_PUBLIC_KEY=$(cat "$public_key_file")" >> "$GITHUB_ENV"
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
+        uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
         run: terraform init
+
+      - name: Import existing AWS resources
+        run: |
+          set -euo pipefail
+          if aws ec2 describe-key-pairs --key-names "$SSH_KEY_NAME" >/dev/null 2>&1; then
+            terraform import -input=false -lock=false aws_key_pair.yankovskyi_keypair "$SSH_KEY_NAME" || true
+          fi
+
+          if aws s3api head-bucket --bucket "$BUCKET_NAME" >/dev/null 2>&1; then
+            terraform import -input=false -lock=false aws_s3_bucket.yankovskyi_bucket "$BUCKET_NAME" || true
+          fi
 
       - name: Terraform Validate
         run: terraform validate -no-color
 
       - name: Terraform Plan
-        id: plan
-        run: terraform plan -no-color -out=tfplan
-        # Pipeline stops here if plan fails
+        run: terraform plan -no-color -out=tfplan -var="ssh_public_key=${SSH_PUBLIC_KEY}" -var="ssh_key_name=${SSH_KEY_NAME}"
 
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: terraform apply -auto-approve tfplan
+
+      - name: Publish outputs
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        run: |
+          instance_ip="$(terraform output -raw instance_public_ip)"
+          bucket_name="$(terraform output -raw bucket_name)"
+          printf 'INSTANCE_PUBLIC_IP=%s\n' "$instance_ip" | tee "$RUNNER_TEMP/task1-instance-ip.txt"
+          printf 'BUCKET_NAME=%s\n' "$bucket_name" | tee "$RUNNER_TEMP/task1-bucket-name.txt"
+          {
+            echo '### Task 1 Outputs'
+            echo "- Instance IP: $instance_ip"
+            echo "- Bucket: $bucket_name"
+          } >> "$GITHUB_STEP_SUMMARY"

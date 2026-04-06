@@ -18,8 +18,11 @@
           - apt-transport-https
           - ca-certificates
           - curl
-          - software-properties-common
+          - git
+          - jq
+          - socat
           - conntrack
+          - software-properties-common
         state: present
 
     - name: Install Docker
@@ -61,9 +64,13 @@
 
     - name: Start Minikube
       become: no
-      command: minikube start --driver=docker --ports=8002:8002,8003:8003
+      command: minikube start --driver=docker
       register: minikube_start
       changed_when: "'Done! kubectl is now configured to use' in minikube_start.stdout"
+
+    - name: Verify Kubernetes API is reachable
+      become: no
+      command: kubectl get nodes
 
     - name: Setup Kubectl port forwarding proxy script
       copy:

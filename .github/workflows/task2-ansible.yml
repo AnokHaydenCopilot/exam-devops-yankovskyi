@@ -6,6 +6,11 @@ on:
       server_ip:
         description: 'Target EC2 Public IP address'
         required: true
+        type: string
+
+env:
+  AWS_REGION: eu-central-1
+  SSH_SECRET_NAME: yankovskyi/ci/ssh-key
 
 jobs:
   ansible:
@@ -15,12 +20,26 @@ jobs:
         working-directory: ./task2
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Setup SSH Key
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Ansible
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible jq
+
+      - name: Load SSH Key
+        run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/yankovskyi_key
+          secret_json="$(aws secretsmanager get-secret-value --secret-id "$SSH_SECRET_NAME" --query SecretString --output text)"
+          printf '%s\n' "$secret_json" | jq -r '.private_key' > ~/.ssh/yankovskyi_key
           chmod 600 ~/.ssh/yankovskyi_key
 
       - name: Generate Inventory
@@ -40,7 +59,6 @@ jobs:
       - name: Dry Run (Check mode)
         run: |
           ansible-playbook setup.yml -i inventory.ini --check
-        continue-on-error: true # Check might fail for minikube if dependent apps aren't started, but it meets the requirement
 
       - name: Run Ansible Playbook
         run: |

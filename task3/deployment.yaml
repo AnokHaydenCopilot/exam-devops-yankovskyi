@@ -19,6 +19,14 @@ spec:
       containers:
       - name: APP_NAME
         image: IMAGE_NAME:IMAGE_TAG
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
         ports:
         - containerPort: 8000
 ---

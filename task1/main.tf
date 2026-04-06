@@ -12,12 +12,46 @@ terraform {
   }
 }
 
+variable "aws_region" {
+  type    = string
+  default = "eu-central-1"
+}
+
+variable "ssh_key_name" {
+  type    = string
+  default = "yankovskyi-ci-key"
+}
+
+variable "ssh_public_key" {
+  type = string
+}
+
+variable "bucket_name" {
+  type    = string
+  default = "yankovskyi-bucket"
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"
+}
+
+variable "vpc_cidr" {
+  type    = string
+  default = "10.10.10.0/24"
+}
+
+variable "subnet_cidr" {
+  type    = string
+  default = "10.10.10.0/25"
+}
+
 provider "aws" {
-  region = "eu-central-1"
+  region = var.aws_region
 }
 
 resource "aws_vpc" "yankovskyi_vpc" {
-  cidr_block = "10.10.10.0/24"
+  cidr_block = var.vpc_cidr
   tags = {
     Name = "yankovskyi-vpc"
   }
@@ -25,12 +59,20 @@ resource "aws_vpc" "yankovskyi_vpc" {
 
 resource "aws_subnet" "yankovskyi_subnet" {
   vpc_id                  = aws_vpc.yankovskyi_vpc.id
-  cidr_block              = "10.10.10.0/25"
+  cidr_block              = var.subnet_cidr
   map_public_ip_on_launch = true
+
+  tags = {
+    Name = "yankovskyi-subnet"
+  }
 }
 
 resource "aws_internet_gateway" "yankovskyi_igw" {
   vpc_id = aws_vpc.yankovskyi_vpc.id
+
+  tags = {
+    Name = "yankovskyi-igw"
+  }
 }
 
 resource "aws_route_table" "yankovskyi_rt" {
@@ -67,6 +109,10 @@ resource "aws_security_group" "yankovskyi_firewall" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = {
+    Name = "yankovskyi-firewall"
+  }
 }
 
 data "aws_ami" "ubuntu" {
@@ -83,28 +129,51 @@ data "aws_ami" "ubuntu" {
 }
 
 resource "aws_key_pair" "yankovskyi_keypair" {
-  key_name   = "yankovskyi-aws-key"
-  public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDWvzJuCEnoB9at5o7l/v5bMh4PVt9Okk6YsBB8qYHiu28ZslWsiPffsYaqE8+bYzA0r4kMQ608DN4S6i2/2irCMRO03zQH4zBPlw5IoH/VaSMaqf5UB0aviK+Wm5r5xHPFCqNxAqmGMCdq2hIE8ugCTJUpKKXiDtMwQerM9P4L55imU0ZJfNwPNEc5cUyJ9HHotZOOVru2RBDBFygLR3IbimrF5aU8Bjc0zQDauzDbqVjK4IjTyU8/t/quzTP8bXThljk0B/+OrCFdNMqiLgxV3haQwV8dGrkLTW7wIkDJusn6imOPFs99LT0Tt4Jp1bMkJ65P6lALmeWV/1dNtc3vH7FHQpXvAYcf5K0WUE0+078u4eAei0uC/8D2WdIGkq9b5tW7OSNqJuHMymz4VZasLWils0m83I/Mopb4UR0tLwKZzBlPP/2NTKVTD9LQeb2QNiMB5fST51vFjjW87BIm+Ts+pyplzEZiaI1WbUSFK8241NruNbN6JQ2d8JyWB2AW6KJkmBJuH/4r0qLH50ZcwvIhd3A0eymH6P0evKy3kxVnCChDTiXoRnVN07dbg5v4vf1XEAZkrmn+gMKk9W73pRCrzPrg08Bb2nGOl/a8Jf22W+VNrRQLohEmUKRihOHqCZ9Sf1vbsU0RZ1XBgAl4F0xWVGTrRb2jSDn0PV3gxw== moder@MSI"
+  key_name   = var.ssh_key_name
+  public_key = var.ssh_public_key
 }
 
 resource "aws_instance" "yankovskyi_node" {
-  ami           = data.aws_ami.ubuntu.id
-  instance_type = "m7i-flex.large"
-  subnet_id     = aws_subnet.yankovskyi_subnet.id
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  subnet_id              = aws_subnet.yankovskyi_subnet.id
   vpc_security_group_ids = [aws_security_group.yankovskyi_firewall.id]
-  key_name      = aws_key_pair.yankovskyi_keypair.key_name
+  key_name               = aws_key_pair.yankovskyi_keypair.key_name
 
   tags = {
     Name = "yankovskyi-node"
   }
 }
 
-resource "random_pet" "bucket_suffix" {}
-
 resource "aws_s3_bucket" "yankovskyi_bucket" {
-  bucket = "yankovskyi-bucket-${random_pet.bucket_suffix.id}"
+  bucket        = var.bucket_name
+  force_destroy = true
+
+  tags = {
+    Name = "yankovskyi-bucket"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "yankovskyi_bucket_versioning" {
+  bucket = aws_s3_bucket.yankovskyi_bucket.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "yankovskyi_bucket_block" {
+  bucket                  = aws_s3_bucket.yankovskyi_bucket.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
 
 output "instance_public_ip" {
   value = aws_instance.yankovskyi_node.public_ip
+}
+
+output "bucket_name" {
+  value = aws_s3_bucket.yankovskyi_bucket.bucket
 }
