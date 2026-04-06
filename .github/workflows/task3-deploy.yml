@@ -197,15 +197,16 @@ jobs:
           ssh ubuntu@"$TARGET_IP" "pkill -f 'port-forward.*${HOST_PORT}' || true"
           sleep 2
 
-          # Start fresh port-forward for this environment
-          ssh ubuntu@"$TARGET_IP" \
-            "nohup minikube kubectl -- port-forward \
-             --address 0.0.0.0 \
-             svc/${APP_NAME} ${HOST_PORT}:80 \
-             -n ${ENV} \
-             > /tmp/portforward-${ENV}.log 2>&1 &"
+          # Start port-forward in background on the remote server
+          # Use bash -c with careful escaping so variables resolve on the runner side
+          ssh -o ServerAliveInterval=5 ubuntu@"$TARGET_IP" \
+            "bash -c 'nohup minikube kubectl -- port-forward \
+               --address 0.0.0.0 \
+               svc/${APP_NAME} ${HOST_PORT}:80 \
+               -n ${ENV} \
+               > /tmp/portforward-${ENV}.log 2>&1 &'"
 
-          sleep 5
+          sleep 8
 
       # ── Verify ────────────────────────────────────────────────────────────
       - name: Verify application endpoint
