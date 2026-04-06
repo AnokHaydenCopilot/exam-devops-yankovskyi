@@ -91,15 +91,32 @@ jobs:
       - name: Resolve server IP
         run: |
           set -euo pipefail
+          # Priority: 1) manual input  2) GitHub repo var  3) SSM Parameter Store
           TARGET_IP="${{ github.event.inputs.server_ip }}"
+
           if [ -z "$TARGET_IP" ]; then
-            echo "No IP provided — fetching from SSM Parameter Store..."
+            TARGET_IP="${{ vars.INSTANCE_IP }}"
+            if [ -n "$TARGET_IP" ]; then
+              echo "Using GitHub repo variable INSTANCE_IP: $TARGET_IP"
+            fi
+          fi
+
+          if [ -z "$TARGET_IP" ]; then
+            echo "Falling back to SSM Parameter Store..."
             TARGET_IP="$(aws ssm get-parameter \
               --name "$SSM_IP_PARAM" \
               --query 'Parameter.Value' --output text)"
           fi
+
+          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "None" ]; then
+            echo "ERROR: Could not resolve instance IP from any source."
+            echo "Run Task 1 first, or specify server_ip manually."
+            exit 1
+          fi
+
           echo "TARGET_IP=${TARGET_IP}" >> "$GITHUB_ENV"
           echo "Target server: $TARGET_IP"
+
 
       # ── SSH ───────────────────────────────────────────────────────────────
       - name: Configure SSH
